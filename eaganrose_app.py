@@ -27,21 +27,26 @@ with open(".streamlit/config.toml", "w") as f:
 
 st.set_page_config(page_title="Eaganrose Platform", layout="wide")
 
-# Initialize memory for Login, Audit Logging, and the Dynamic CRM
+# Initialize memory for Login, Audit Logging, and the Advanced CRM
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 if "username" not in st.session_state:
     st.session_state["username"] = ""
 if "audit_log" not in st.session_state:
     st.session_state["audit_log"] = []
+    
+# UPGRADED DATA STRUCTURE: Now supports default spoils and SKU-level overrides
 if "vendor_registry" not in st.session_state:
-    # Default seed data
     st.session_state["vendor_registry"] = {
         "0010006727": {
             "name": "DAESANG",
+            "default_spoils": 0.0075, # 0.75% default for Daesang
             "skus": {
-                "1570571": 0.03, "1793017": 0.03, "1908395": 0.05, 
-                "1990882": 0.05, "2059134": 0.05
+                "1570571": {"comm": 0.03, "spoils": None}, 
+                "1793017": {"comm": 0.03, "spoils": None}, 
+                "1908395": {"comm": 0.05, "spoils": None}, 
+                "1990882": {"comm": 0.05, "spoils": None}, 
+                "2059134": {"comm": 0.05, "spoils": None}
             }
         }
     }
@@ -87,7 +92,7 @@ with st.sidebar:
     if not st.session_state["audit_log"]:
         st.info("No actions taken this session.")
     else:
-        for entry in reversed(st.session_state["audit_log"][-5:]): # Show last 5
+        for entry in reversed(st.session_state["audit_log"][-5:]):
             st.caption(f"**{entry['timestamp']}** | 👤 {entry['user']}")
             st.write(f"Processed {entry['files_count']} POs.")
             st.markdown("---")
@@ -98,7 +103,7 @@ with st.sidebar:
         st.rerun()
 
 # =====================================================================
-# 4. CORE EXTRACTION ENGINE (Moved OUT of the UI for cleaner processing)
+# 4. CORE EXTRACTION ENGINE (UPGRADED FOR DYNAMIC ALLOWANCES)
 # =====================================================================
 class InvalidCostcoPOError(Exception):
     pass
@@ -124,13 +129,13 @@ def extract_costco_pdf_data(pdf_file_obj):
     header_data['Purchase Order #'] = po_number 
     
     detected_vendor_name = "UNKNOWN_VENDOR"
-    detected_sku_map = {}
+    detected_vendor_info = None
     
     # Dynamic Registry Check
     for v_id, v_info in st.session_state["vendor_registry"].items():
         if v_id in text:
             detected_vendor_name = v_info["name"]
-            detected_sku_map = v_info["skus"]
+            detected_vendor_info = v_info
             break
             
     header_data['Vendor'] = detected_vendor_name
@@ -180,8 +185,25 @@ def extract_costco_pdf_data(pdf_file_obj):
         item_dict['Item Description'] = desc
         item_dict['Unit Cost'] = unit_cost
         item_dict['Qty'] = qty
-        item_dict['Com   %   Rate'] = detected_sku_map.get(sku, 0.0)
-        item_dict['Spoils'] = 0.0075  
+        
+        # --- DYNAMIC RATE APPLICATION ---
+        comm_rate = 0.0
+        spoils_rate = 0.0075 # Absolute fallback
+        
+        if detected_vendor_info:
+            spoils_rate = detected_vendor_info.get("default_spoils", 0.0075)
+            sku_data = detected_vendor_info["skus"].get(sku, {})
+            
+            if isinstance(sku_data, dict):
+                comm_rate = sku_data.get("comm", 0.0)
+                if sku_data.get("spoils") is not None:
+                    spoils_rate = sku_data["spoils"] # Override with SKU specific spoil rate
+            else:
+                comm_rate = sku_data # Legacy fallback just in case
+                
+        item_dict['Com   %   Rate'] = comm_rate
+        item_dict['Spoils'] = spoils_rate
+        # ---------------------------------
         
         chunk_start = match.end()
         chunk_end = item_matches[i+1].start() if i + 1 < len(item_matches) else len(text)
@@ -208,7 +230,7 @@ def extract_costco_pdf_data(pdf_file_obj):
         item_dict['Freight Allowance'] = freight_allowance
         
         gross_amt = unit_cost * qty
-        spoils_calc = gross_amt * 0.0075
+        spoils_calc = gross_amt * spoils_rate # NOW USES DYNAMIC RATE
         item_dict['Net Inv Amt'] = gross_amt - demo_total - spoils_calc - freight_allowance
         
         items_data.append(item_dict)
@@ -306,9 +328,9 @@ def create_excel_buffer(master_df):
 # =====================================================================
 # 5. TABBED UI LAYOUT
 # =====================================================================
-tab_audit, tab_crm = st.tabs(["🔍 Audit Engine", "🤝 Vendor CRM"])
+tab_audit, tab_crm = st.tabs(["🔍 Audit Engine", "🤝 Vendor & Allowance Matrix"])
 
-# --- MODULE A: AUDIT ENGINE (Default Tab) ---
+# --- MODULE A: AUDIT ENGINE ---
 with tab_audit:
     try:
         st.image("eagan rose logo.png", width=250)
@@ -360,6 +382,7 @@ with tab_audit:
                     
                     with chart_col1:
                         st.markdown("**Allowance Breakdown**")
+                        # Spoils are now calculated dynamically per row!
                         tot_spoils = (master_df['Unit Cost'] * master_df['Qty'] * master_df['Spoils']).sum()
                         tot_demo = master_df['Demo Accrual Deduction'].sum()
                         tot_freight = master_df['Freight Allowance'].sum()
@@ -398,31 +421,35 @@ with tab_audit:
                     with st.expander("View Error Log"):
                         for fail in failed_files: st.write(f"- **{fail['filename']}**: {fail['error']}")
 
-# --- MODULE B: VENDOR CRM ---
+# --- MODULE B: VENDOR & ALLOWANCE MATRIX ---
 with tab_crm:
-    st.title("Vendor CRM & Commission Matrix")
-    st.markdown("Manage vendor IDs and map SKU commission rates dynamically. Changes applied here will immediately take effect in the Audit Engine.")
+    st.title("Vendor & Allowance Matrix")
+    st.markdown("Manage vendor IDs, default allowances, and map SKU commission rates dynamically. Changes applied here immediately take effect in the Audit Engine.")
     st.markdown("---")
     
     col_crm_1, col_crm_2 = st.columns(2)
     
     with col_crm_1:
-        st.markdown("### ➕ Add New Vendor")
+        st.markdown("### ➕ Add/Edit Vendor Profile")
         with st.form("add_vendor_form", clear_on_submit=True):
             new_v_name = st.text_input("Vendor Name (e.g., KRAFT HEINZ)").upper()
             new_v_id = st.text_input("Costco Vendor ID (Exact match required)")
-            submit_vendor = st.form_submit_button("Create Vendor Profile")
+            new_v_spoils = st.number_input("Default Spoils Allowance % (e.g., 0.75)", value=0.75, step=0.05)
+            
+            submit_vendor = st.form_submit_button("Save Vendor Profile")
             
             if submit_vendor:
                 if new_v_id and new_v_name:
-                    if new_v_id in st.session_state["vendor_registry"]:
-                        st.error("Vendor ID already exists!")
+                    if new_v_id not in st.session_state["vendor_registry"]:
+                        st.session_state["vendor_registry"][new_v_id] = {"name": new_v_name, "default_spoils": new_v_spoils / 100.0, "skus": {}}
+                        st.success(f"Vendor {new_v_name} created with {new_v_spoils}% default spoils.")
                     else:
-                        st.session_state["vendor_registry"][new_v_id] = {"name": new_v_name, "skus": {}}
-                        st.success(f"Vendor {new_v_name} added successfully!")
-                        st.rerun()
+                        st.session_state["vendor_registry"][new_v_id]["name"] = new_v_name
+                        st.session_state["vendor_registry"][new_v_id]["default_spoils"] = new_v_spoils / 100.0
+                        st.success(f"Vendor {new_v_name} updated successfully.")
+                    st.rerun()
                 else:
-                    st.warning("Please fill out both fields.")
+                    st.warning("Please fill out Vendor Name and ID.")
 
     with col_crm_2:
         st.markdown("### 📦 Add/Update SKU Rates")
@@ -434,15 +461,26 @@ with tab_crm:
             with st.form("add_sku_form", clear_on_submit=True):
                 selected_v_name = st.selectbox("Select Vendor", list(vendor_options.keys()))
                 new_sku = st.text_input("Costco Item # (SKU)")
-                new_rate = st.number_input("Commission Rate % (e.g., 3.0 for 3%)", min_value=0.0, max_value=100.0, step=0.1)
+                
+                col_sku_1, col_sku_2 = st.columns(2)
+                with col_sku_1:
+                    new_rate = st.number_input("Commission %", min_value=0.0, max_value=100.0, step=0.1)
+                with col_sku_2:
+                    new_sku_spoils = st.number_input("Spoils Override % (0 = Use Vendor Default)", min_value=0.0, max_value=100.0, step=0.1)
+                    
                 submit_sku = st.form_submit_button("Save SKU to Matrix")
                 
                 if submit_sku:
                     if new_sku:
                         v_id = vendor_options[selected_v_name]
                         decimal_rate = new_rate / 100.0
-                        st.session_state["vendor_registry"][v_id]["skus"][new_sku] = decimal_rate
-                        st.success(f"SKU {new_sku} saved at {new_rate}% for {selected_v_name}.")
+                        decimal_spoils = (new_sku_spoils / 100.0) if new_sku_spoils > 0 else None
+                        
+                        st.session_state["vendor_registry"][v_id]["skus"][new_sku] = {
+                            "comm": decimal_rate,
+                            "spoils": decimal_spoils
+                        }
+                        st.success(f"SKU {new_sku} saved for {selected_v_name}.")
                         st.rerun()
                     else:
                         st.warning("Please enter a valid SKU.")
@@ -451,12 +489,21 @@ with tab_crm:
     st.markdown("### 🗄️ Current Active Directory")
     
     for v_id, v_info in st.session_state["vendor_registry"].items():
-        with st.expander(f"🏢 {v_info['name']} (ID: {v_id})", expanded=True):
+        v_spoils_display = v_info.get('default_spoils', 0.0075) * 100
+        with st.expander(f"🏢 {v_info['name']} (ID: {v_id}) | Base Spoils: {v_spoils_display:.2f}%", expanded=True):
             if not v_info["skus"]:
                 st.write("No SKUs mapped yet.")
             else:
-                sku_df = pd.DataFrame([
-                    {"Costco Item #": sku, "Commission Rate": f"{rate*100:.1f}%"} 
-                    for sku, rate in v_info["skus"].items()
-                ])
-                st.dataframe(sku_df, use_container_width=True, hide_index=True)
+                formatted_skus = []
+                for sku, data in v_info["skus"].items():
+                    # Handle data cleanly
+                    comm = data['comm'] if isinstance(data, dict) else data
+                    spoils = data.get('spoils') if isinstance(data, dict) else None
+                    
+                    formatted_skus.append({
+                        "Costco Item #": sku, 
+                        "Commission Rate": f"{comm*100:.1f}%",
+                        "Spoils Rate": f"{spoils*100:.2f}% (Override)" if spoils is not None else f"Vendor Default ({v_spoils_display:.2f}%)"
+                    })
+                    
+                st.dataframe(pd.DataFrame(formatted_skus), use_container_width=True, hide_index=True)
