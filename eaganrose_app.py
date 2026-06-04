@@ -8,11 +8,11 @@ import io
 from dateutil.relativedelta import relativedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+
 import plotly.express as px
 
 # =====================================================================
-# 1. AUTO-THEMING ENGINE
+# 1. AUTO-THEMING ENGINE & SESSION STATE
 # =====================================================================
 os.makedirs(".streamlit", exist_ok=True)
 theme_config = """
@@ -25,6 +25,16 @@ font = "sans serif"
 """
 with open(".streamlit/config.toml", "w") as f:
     f.write(theme_config)
+
+st.set_page_config(page_title="Eaganrose Engine", layout="wide")
+
+# Initialize memory for Login and Audit Logging
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+if "username" not in st.session_state:
+    st.session_state["username"] = ""
+if "audit_log" not in st.session_state:
+    st.session_state["audit_log"] = []
 
 # =====================================================================
 # 2. PLATFORM CONFIGURATION & VENDOR REGISTRY
@@ -39,11 +49,59 @@ VENDOR_REGISTRY = {
     }
 }
 
-st.set_page_config(page_title="Eaganrose Engine", layout="wide")
+# =====================================================================
+# 3. AUTHENTICATION MODULE
+# =====================================================================
+# Hardcoded credentials for the private repository
+USER_DATABASE = {
+    "colton.rose": "admin123",
+    "account.manager": "eaganrose"
+}
+
+def login_screen():
+    st.markdown("<h1 style='text-align: center;'>Eaganrose Secure Portal</h1>", unsafe_allow_html=True)
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        st.markdown("### 🔐 Authorized Access Only")
+        username_input = st.text_input("Username")
+        password_input = st.text_input("Password", type="password")
+        
+        if st.button("Sign In", use_container_width=True):
+            if username_input in USER_DATABASE and USER_DATABASE[username_input] == password_input:
+                st.session_state["logged_in"] = True
+                st.session_state["username"] = username_input
+                st.rerun()
+            else:
+                st.error("Invalid credentials. Please try again.")
+
+# If not logged in, show the login screen and stop the script from running further
+if not st.session_state["logged_in"]:
+    login_screen()
+    st.stop()
 
 # =====================================================================
-# 3. FRONTEND UI & BRANDING
+# 4. FRONTEND UI & BRANDING (POST-LOGIN)
 # =====================================================================
+with st.sidebar:
+    st.success(f"👤 Logged in as: **{st.session_state['username']}**")
+    if st.button("Log Out", use_container_width=True):
+        st.session_state["logged_in"] = False
+        st.session_state["username"] = ""
+        st.rerun()
+        
+    st.markdown("---")
+    st.markdown("### 📜 Session Audit Log")
+    if not st.session_state["audit_log"]:
+        st.info("No actions taken this session.")
+    else:
+        for entry in reversed(st.session_state["audit_log"]):
+            st.caption(f"**{entry['timestamp']}**")
+            st.write(f"Processed {entry['files_count']} POs.")
+            st.caption(f"POs: {entry['po_numbers']}")
+            st.markdown("---")
+
 try:
     st.image("eagan rose logo.png", width=250)
 except Exception:
@@ -54,7 +112,7 @@ st.markdown("Automated PDF Ingestion & Variance Auditing for Costco Vendors")
 st.markdown("---")
 
 # =====================================================================
-# 4. CORE EXTRACTION ENGINE
+# 5. CORE EXTRACTION ENGINE
 # =====================================================================
 class InvalidCostcoPOError(Exception):
     pass
@@ -74,7 +132,6 @@ def extract_costco_pdf_data(pdf_file_obj):
     if not order_match:
         raise InvalidCostcoPOError("Missing 'Order #'. This does not appear to be a valid Costco PO.")
         
-    # --- HEADER EXTRACTION ---
     header_data = {}
     po_number = order_match.group(1)
     header_data['PO #'] = po_number
@@ -118,9 +175,7 @@ def extract_costco_pdf_data(pdf_file_obj):
     else:
         header_data['PO Date'], header_data[' PO Del Date'], header_data['Cancel Date'], header_data["Est'd  Month   Pay'd"] = "", "", "", ""
     
-    # --- MULTI-ITEM EXTRACTION LOOP ---
     items_data = []
-    
     item_matches = list(re.finditer(r"^(\d{1,3})\s+(\d{7})\s+.*?([A-Za-z].*?)\s+([\d\,\.]+)\s+(\d+)\s+CA", text, re.MULTILINE))
     
     if not item_matches:
@@ -128,7 +183,6 @@ def extract_costco_pdf_data(pdf_file_obj):
         
     for i, match in enumerate(item_matches):
         item_dict = header_data.copy()
-        
         sku = match.group(2)
         desc = match.group(3).strip().title()
         unit_cost = float(match.group(4).replace(',', ''))
@@ -141,7 +195,6 @@ def extract_costco_pdf_data(pdf_file_obj):
         item_dict['Com   %   Rate'] = detected_sku_map.get(sku, 0.0)
         item_dict['Spoils'] = 0.0075  
         
-        # Isolate text chunk for allowances
         chunk_start = match.end()
         chunk_end = item_matches[i+1].start() if i + 1 < len(item_matches) else len(text)
         item_chunk = text[chunk_start:chunk_end]
@@ -152,15 +205,12 @@ def extract_costco_pdf_data(pdf_file_obj):
         for line in allowance_lines:
             if re.search(r"SPOIL", line, re.IGNORECASE):
                 continue
-                
             amounts = re.findall(r"[\d\,]+\.\d{2}", line)
             if amounts:
                 first_amount = float(amounts[0].replace(',', ''))
                 last_amount = float(amounts[-1].replace(',', ''))
-                
                 if first_amount < 2.0:
                     continue
-                    
                 demo_total += last_amount
                     
         item_dict['Demo Accrual Deduction'] = demo_total
@@ -169,7 +219,6 @@ def extract_costco_pdf_data(pdf_file_obj):
         freight_allowance = float(freight_match.group(1)) * qty if freight_match else 0.0
         item_dict['Freight Allowance'] = freight_allowance
         
-        # Calculate True Net Inventory Amount (Gross - Allowances)
         gross_amt = unit_cost * qty
         spoils_calc = gross_amt * 0.0075
         item_dict['Net Inv Amt'] = gross_amt - demo_total - spoils_calc - freight_allowance
@@ -179,7 +228,7 @@ def extract_costco_pdf_data(pdf_file_obj):
     return items_data
 
 # =====================================================================
-# 5. DATA ROUTING & CALCULATIONS
+# 6. DATA ROUTING & CALCULATIONS
 # =====================================================================
 def process_and_merge(df):
     bd_mask = df['Region'].str.contains('BD', case=False, na=False)
@@ -196,7 +245,7 @@ def process_and_merge(df):
     return master_df
 
 # =====================================================================
-# 6. EXCEL EXPORT ENGINE
+# 7. EXCEL EXPORT ENGINE
 # =====================================================================
 def parse_date(date_str):
     if not date_str: return None
@@ -252,27 +301,17 @@ def create_excel_buffer(master_df):
             
             col = cell.column
             
-            if col in [4, 24]: 
-                cell.alignment = right_align
-            elif col in [6, 9]: 
-                cell.alignment = left_align
+            if col in [4, 24]: cell.alignment = right_align
+            elif col in [6, 9]: cell.alignment = left_align
             
-            if col == 5: 
-                cell.number_format = '0000' 
-            elif col in [13, 23]: 
-                cell.number_format = '0.00'
-            elif col == 12: 
-                cell.number_format = '#,##0' 
-            elif col in [14, 18]: 
-                cell.number_format = '0.00%'
-            elif col in [15, 16]: 
-                cell.number_format = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)'
-            elif col in [17, 19, 24]: 
-                cell.number_format = '"$"#,##0.00'
-            elif col in [1, 10, 11]: 
-                cell.number_format = 'dd-mmm-yy'
-            elif col == 20: 
-                cell.number_format = 'mmm-yy'
+            if col == 5: cell.number_format = '0000' 
+            elif col in [13, 23]: cell.number_format = '0.00'
+            elif col == 12: cell.number_format = '#,##0' 
+            elif col in [14, 18]: cell.number_format = '0.00%'
+            elif col in [15, 16]: cell.number_format = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)'
+            elif col in [17, 19, 24]: cell.number_format = '"$"#,##0.00'
+            elif col in [1, 10, 11]: cell.number_format = 'dd-mmm-yy'
+            elif col == 20: cell.number_format = 'mmm-yy'
                 
         row_idx = row[0].row
         ws[f'S{row_idx}'] = f'=Q{row_idx}*R{row_idx}'
@@ -283,7 +322,7 @@ def create_excel_buffer(master_df):
     return output
 
 # =====================================================================
-# 7. APP EXECUTION TRIGGER & DASHBOARD
+# 8. APP EXECUTION TRIGGER & DASHBOARD
 # =====================================================================
 uploaded_files = st.file_uploader("Upload Costco POs (PDF)", type="pdf", accept_multiple_files=True)
 
@@ -300,12 +339,22 @@ if uploaded_files:
             
             if all_data:
                 master_df = process_and_merge(pd.DataFrame(all_data))
+                
+                # --- AUDIT LOGGING ---
+                # Record this action into the session state
+                unique_pos = list(master_df['Purchase Order #'].unique())
+                st.session_state["audit_log"].append({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %I:%M %p"),
+                    "user": st.session_state["username"],
+                    "files_count": len(uploaded_files),
+                    "po_numbers": ", ".join(unique_pos)
+                })
+                
                 st.success(f"Audit Complete! Processed {len(master_df)} valid records.")
                 
                 # --- INTERACTIVE ANALYTICS DASHBOARD ---
                 st.markdown("### 📊 Operational Summary")
                 
-                # 1. KPI Cards
                 col1, col2, col3 = st.columns(3)
                 tot_net = master_df['Net Inv Amt'].sum()
                 tot_comm = (master_df['Net Inv Amt'] * master_df['Com   %   Rate']).sum()
@@ -316,8 +365,6 @@ if uploaded_files:
                 col3.metric("Total Cases (Qty)", f"{tot_qty:,}")
                 
                 st.markdown("---")
-                
-                # 2. Charts
                 chart_col1, chart_col2 = st.columns(2)
                 
                 with chart_col1:
@@ -340,7 +387,7 @@ if uploaded_files:
                 with chart_col2:
                     st.markdown("**Volume by SKU (Cases)**")
                     sku_df = master_df.groupby("Item Description")['Qty'].sum().reset_index()
-                    sku_df = sku_df.sort_values(by='Qty', ascending=True) # Sort for horizontal bar chart
+                    sku_df = sku_df.sort_values(by='Qty', ascending=True) 
                     
                     fig_bar = px.bar(sku_df, x='Qty', y='Item Description', orientation='h',
                                      color_discrete_sequence=["#8E2D28"])
