@@ -9,6 +9,7 @@ from dateutil.relativedelta import relativedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+import plotly.express as px
 
 # =====================================================================
 # 1. AUTO-THEMING ENGINE
@@ -90,7 +91,6 @@ def extract_costco_pdf_data(pdf_file_obj):
     header_data['Vendor'] = detected_vendor_name
     
     if len(po_number) >= 11:
-        # Removed integer conversion to preserve leading zero
         header_data['Extracted PO Date'] = po_number[-7:-3] 
         header_data['PO Sequence'] = po_number[-3:]
         header_data['Extracted Depot'] = po_number[:-7].lstrip('0') 
@@ -258,7 +258,7 @@ def create_excel_buffer(master_df):
                 cell.alignment = left_align
             
             if col == 5: 
-                cell.number_format = '0000' # Explicitly lock Column E to a 4-digit format
+                cell.number_format = '0000' 
             elif col in [13, 23]: 
                 cell.number_format = '0.00'
             elif col == 12: 
@@ -283,7 +283,7 @@ def create_excel_buffer(master_df):
     return output
 
 # =====================================================================
-# 7. APP EXECUTION TRIGGER
+# 7. APP EXECUTION TRIGGER & DASHBOARD
 # =====================================================================
 uploaded_files = st.file_uploader("Upload Costco POs (PDF)", type="pdf", accept_multiple_files=True)
 
@@ -301,12 +301,62 @@ if uploaded_files:
             if all_data:
                 master_df = process_and_merge(pd.DataFrame(all_data))
                 st.success(f"Audit Complete! Processed {len(master_df)} valid records.")
+                
+                # --- INTERACTIVE ANALYTICS DASHBOARD ---
+                st.markdown("### 📊 Operational Summary")
+                
+                # 1. KPI Cards
+                col1, col2, col3 = st.columns(3)
+                tot_net = master_df['Net Inv Amt'].sum()
+                tot_comm = (master_df['Net Inv Amt'] * master_df['Com   %   Rate']).sum()
+                tot_qty = int(master_df['Qty'].sum())
+                
+                col1.metric("Total Net Inventory", f"${tot_net:,.2f}")
+                col2.metric("Est. Commission Earned", f"${tot_comm:,.2f}")
+                col3.metric("Total Cases (Qty)", f"{tot_qty:,}")
+                
+                st.markdown("---")
+                
+                # 2. Charts
+                chart_col1, chart_col2 = st.columns(2)
+                
+                with chart_col1:
+                    st.markdown("**Allowance Breakdown**")
+                    tot_spoils = (master_df['Unit Cost'] * master_df['Qty'] * master_df['Spoils']).sum()
+                    tot_demo = master_df['Demo Accrual Deduction'].sum()
+                    tot_freight = master_df['Freight Allowance'].sum()
+                    
+                    allowance_df = pd.DataFrame({
+                        "Allowance Type": ["Spoils", "Demo Accrual", "Freight"],
+                        "Amount ($)": [tot_spoils, tot_demo, tot_freight]
+                    })
+                    
+                    fig_donut = px.pie(allowance_df, values='Amount ($)', names='Allowance Type', hole=0.4,
+                                       color='Allowance Type',
+                                       color_discrete_map={"Spoils": "#8E2D28", "Demo Accrual": "#FFC000", "Freight": "#1E1E1E"})
+                    fig_donut.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+                    st.plotly_chart(fig_donut, use_container_width=True)
+                
+                with chart_col2:
+                    st.markdown("**Volume by SKU (Cases)**")
+                    sku_df = master_df.groupby("Item Description")['Qty'].sum().reset_index()
+                    sku_df = sku_df.sort_values(by='Qty', ascending=True) # Sort for horizontal bar chart
+                    
+                    fig_bar = px.bar(sku_df, x='Qty', y='Item Description', orientation='h',
+                                     color_discrete_sequence=["#8E2D28"])
+                    fig_bar.update_layout(margin=dict(t=20, b=20, l=20, r=20), xaxis_title="Total Cases", yaxis_title="")
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                
+                st.markdown("---")
+                
+                # --- EXCEL EXPORT ---
                 st.download_button(
                     label="📥 Download Master Ledger (Excel)",
                     data=create_excel_buffer(master_df),
                     file_name="Audit Software: Delete After Use.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+                
             if failed_files:
                 st.warning(f"⚠️ Skipped {len(failed_files)} file(s).")
                 with st.expander("View Error Log"):
