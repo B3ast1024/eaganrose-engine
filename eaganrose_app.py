@@ -8,7 +8,6 @@ import io
 from dateutil.relativedelta import relativedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-
 import plotly.express as px
 
 # =====================================================================
@@ -26,33 +25,30 @@ font = "sans serif"
 with open(".streamlit/config.toml", "w") as f:
     f.write(theme_config)
 
-st.set_page_config(page_title="Eaganrose Engine", layout="wide")
+st.set_page_config(page_title="Eaganrose Platform", layout="wide")
 
-# Initialize memory for Login and Audit Logging
+# Initialize memory for Login, Audit Logging, and the Dynamic CRM
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 if "username" not in st.session_state:
     st.session_state["username"] = ""
 if "audit_log" not in st.session_state:
     st.session_state["audit_log"] = []
-
-# =====================================================================
-# 2. PLATFORM CONFIGURATION & VENDOR REGISTRY
-# =====================================================================
-VENDOR_REGISTRY = {
-    "0010006727": {
-        "name": "DAESANG",
-        "skus": {
-            "1570571": 0.03, "1793017": 0.03, "1908395": 0.05, 
-            "1990882": 0.05, "2059134": 0.05
+if "vendor_registry" not in st.session_state:
+    # Default seed data
+    st.session_state["vendor_registry"] = {
+        "0010006727": {
+            "name": "DAESANG",
+            "skus": {
+                "1570571": 0.03, "1793017": 0.03, "1908395": 0.05, 
+                "1990882": 0.05, "2059134": 0.05
+            }
         }
     }
-}
 
 # =====================================================================
-# 3. AUTHENTICATION MODULE
+# 2. AUTHENTICATION MODULE
 # =====================================================================
-# Hardcoded credentials for the private repository
 USER_DATABASE = {
     "colton.rose": "admin123",
     "account.manager": "eaganrose"
@@ -76,43 +72,33 @@ def login_screen():
             else:
                 st.error("Invalid credentials. Please try again.")
 
-# If not logged in, show the login screen and stop the script from running further
 if not st.session_state["logged_in"]:
     login_screen()
     st.stop()
 
 # =====================================================================
-# 4. FRONTEND UI & BRANDING (POST-LOGIN)
+# 3. GLOBAL SIDEBAR (AUDIT LOG & LOGOUT)
 # =====================================================================
 with st.sidebar:
     st.success(f"👤 Logged in as: **{st.session_state['username']}**")
-    if st.button("Log Out", use_container_width=True):
-        st.session_state["logged_in"] = False
-        st.session_state["username"] = ""
-        st.rerun()
-        
     st.markdown("---")
+    
     st.markdown("### 📜 Session Audit Log")
     if not st.session_state["audit_log"]:
         st.info("No actions taken this session.")
     else:
-        for entry in reversed(st.session_state["audit_log"]):
-            st.caption(f"**{entry['timestamp']}**")
+        for entry in reversed(st.session_state["audit_log"][-5:]): # Show last 5
+            st.caption(f"**{entry['timestamp']}** | 👤 {entry['user']}")
             st.write(f"Processed {entry['files_count']} POs.")
-            st.caption(f"POs: {entry['po_numbers']}")
             st.markdown("---")
-
-try:
-    st.image("eagan rose logo.png", width=250)
-except Exception:
-    pass
-
-st.title("Eaganrose Reconciliation Engine")
-st.markdown("Automated PDF Ingestion & Variance Auditing for Costco Vendors")
-st.markdown("---")
+            
+    if st.button("Log Out", use_container_width=True):
+        st.session_state["logged_in"] = False
+        st.session_state["username"] = ""
+        st.rerun()
 
 # =====================================================================
-# 5. CORE EXTRACTION ENGINE
+# 4. CORE EXTRACTION ENGINE (Moved OUT of the UI for cleaner processing)
 # =====================================================================
 class InvalidCostcoPOError(Exception):
     pass
@@ -139,7 +125,9 @@ def extract_costco_pdf_data(pdf_file_obj):
     
     detected_vendor_name = "UNKNOWN_VENDOR"
     detected_sku_map = {}
-    for v_id, v_info in VENDOR_REGISTRY.items():
+    
+    # Dynamic Registry Check
+    for v_id, v_info in st.session_state["vendor_registry"].items():
         if v_id in text:
             detected_vendor_name = v_info["name"]
             detected_sku_map = v_info["skus"]
@@ -227,9 +215,6 @@ def extract_costco_pdf_data(pdf_file_obj):
         
     return items_data
 
-# =====================================================================
-# 6. DATA ROUTING & CALCULATIONS
-# =====================================================================
 def process_and_merge(df):
     bd_mask = df['Region'].str.contains('BD', case=False, na=False)
     bd_data = df[bd_mask].copy()
@@ -244,9 +229,6 @@ def process_and_merge(df):
         master_df = master_df.sort_values(by='PO Date', ascending=True)
     return master_df
 
-# =====================================================================
-# 7. EXCEL EXPORT ENGINE
-# =====================================================================
 def parse_date(date_str):
     if not date_str: return None
     try: return datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -300,7 +282,6 @@ def create_excel_buffer(master_df):
             cell.alignment = center_align 
             
             col = cell.column
-            
             if col in [4, 24]: cell.alignment = right_align
             elif col in [6, 9]: cell.alignment = left_align
             
@@ -321,90 +302,161 @@ def create_excel_buffer(master_df):
     output.seek(0)
     return output
 
-# =====================================================================
-# 8. APP EXECUTION TRIGGER & DASHBOARD
-# =====================================================================
-uploaded_files = st.file_uploader("Upload Costco POs (PDF)", type="pdf", accept_multiple_files=True)
 
-if uploaded_files:
-    if st.button("Run Audit Engine"):
-        with st.spinner(f"Ingesting {len(uploaded_files)} Purchase Orders..."):
-            all_data, failed_files = [], []
-            for pdf_file in uploaded_files:
-                try:
-                    extracted_items = extract_costco_pdf_data(pdf_file)
-                    all_data.extend(extracted_items)
-                except Exception as e:
-                    failed_files.append({"filename": pdf_file.name, "error": str(e)})
-            
-            if all_data:
-                master_df = process_and_merge(pd.DataFrame(all_data))
+# =====================================================================
+# 5. TABBED UI LAYOUT
+# =====================================================================
+tab_audit, tab_crm = st.tabs(["🔍 Audit Engine", "🤝 Vendor CRM"])
+
+# --- MODULE A: AUDIT ENGINE (Default Tab) ---
+with tab_audit:
+    try:
+        st.image("eagan rose logo.png", width=250)
+    except Exception:
+        pass
+
+    st.title("Eaganrose Reconciliation Engine")
+    st.markdown("Automated PDF Ingestion & Variance Auditing for Costco Vendors")
+    st.markdown("---")
+
+    uploaded_files = st.file_uploader("Upload Costco POs (PDF)", type="pdf", accept_multiple_files=True)
+
+    if uploaded_files:
+        if st.button("Run Audit Engine"):
+            with st.spinner(f"Ingesting {len(uploaded_files)} Purchase Orders..."):
+                all_data, failed_files = [], []
+                for pdf_file in uploaded_files:
+                    try:
+                        extracted_items = extract_costco_pdf_data(pdf_file)
+                        all_data.extend(extracted_items)
+                    except Exception as e:
+                        failed_files.append({"filename": pdf_file.name, "error": str(e)})
                 
-                # --- AUDIT LOGGING ---
-                # Record this action into the session state
-                unique_pos = list(master_df['Purchase Order #'].unique())
-                st.session_state["audit_log"].append({
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %I:%M %p"),
-                    "user": st.session_state["username"],
-                    "files_count": len(uploaded_files),
-                    "po_numbers": ", ".join(unique_pos)
-                })
-                
-                st.success(f"Audit Complete! Processed {len(master_df)} valid records.")
-                
-                # --- INTERACTIVE ANALYTICS DASHBOARD ---
-                st.markdown("### 📊 Operational Summary")
-                
-                col1, col2, col3 = st.columns(3)
-                tot_net = master_df['Net Inv Amt'].sum()
-                tot_comm = (master_df['Net Inv Amt'] * master_df['Com   %   Rate']).sum()
-                tot_qty = int(master_df['Qty'].sum())
-                
-                col1.metric("Total Net Inventory", f"${tot_net:,.2f}")
-                col2.metric("Est. Commission Earned", f"${tot_comm:,.2f}")
-                col3.metric("Total Cases (Qty)", f"{tot_qty:,}")
-                
-                st.markdown("---")
-                chart_col1, chart_col2 = st.columns(2)
-                
-                with chart_col1:
-                    st.markdown("**Allowance Breakdown**")
-                    tot_spoils = (master_df['Unit Cost'] * master_df['Qty'] * master_df['Spoils']).sum()
-                    tot_demo = master_df['Demo Accrual Deduction'].sum()
-                    tot_freight = master_df['Freight Allowance'].sum()
+                if all_data:
+                    master_df = process_and_merge(pd.DataFrame(all_data))
                     
-                    allowance_df = pd.DataFrame({
-                        "Allowance Type": ["Spoils", "Demo Accrual", "Freight"],
-                        "Amount ($)": [tot_spoils, tot_demo, tot_freight]
+                    unique_pos = list(master_df['Purchase Order #'].unique())
+                    st.session_state["audit_log"].append({
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %I:%M %p"),
+                        "user": st.session_state["username"],
+                        "files_count": len(uploaded_files),
+                        "po_numbers": ", ".join(unique_pos)
                     })
                     
-                    fig_donut = px.pie(allowance_df, values='Amount ($)', names='Allowance Type', hole=0.4,
-                                       color='Allowance Type',
-                                       color_discrete_map={"Spoils": "#8E2D28", "Demo Accrual": "#FFC000", "Freight": "#1E1E1E"})
-                    fig_donut.update_layout(margin=dict(t=20, b=20, l=20, r=20))
-                    st.plotly_chart(fig_donut, use_container_width=True)
-                
-                with chart_col2:
-                    st.markdown("**Volume by SKU (Cases)**")
-                    sku_df = master_df.groupby("Item Description")['Qty'].sum().reset_index()
-                    sku_df = sku_df.sort_values(by='Qty', ascending=True) 
+                    st.success(f"Audit Complete! Processed {len(master_df)} valid records.")
                     
-                    fig_bar = px.bar(sku_df, x='Qty', y='Item Description', orientation='h',
-                                     color_discrete_sequence=["#8E2D28"])
-                    fig_bar.update_layout(margin=dict(t=20, b=20, l=20, r=20), xaxis_title="Total Cases", yaxis_title="")
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                    st.markdown("### 📊 Operational Summary")
+                    col1, col2, col3 = st.columns(3)
+                    tot_net = master_df['Net Inv Amt'].sum()
+                    tot_comm = (master_df['Net Inv Amt'] * master_df['Com   %   Rate']).sum()
+                    tot_qty = int(master_df['Qty'].sum())
+                    
+                    col1.metric("Total Net Inventory", f"${tot_net:,.2f}")
+                    col2.metric("Est. Commission Earned", f"${tot_comm:,.2f}")
+                    col3.metric("Total Cases (Qty)", f"{tot_qty:,}")
+                    
+                    st.markdown("---")
+                    chart_col1, chart_col2 = st.columns(2)
+                    
+                    with chart_col1:
+                        st.markdown("**Allowance Breakdown**")
+                        tot_spoils = (master_df['Unit Cost'] * master_df['Qty'] * master_df['Spoils']).sum()
+                        tot_demo = master_df['Demo Accrual Deduction'].sum()
+                        tot_freight = master_df['Freight Allowance'].sum()
+                        
+                        allowance_df = pd.DataFrame({
+                            "Allowance Type": ["Spoils", "Demo Accrual", "Freight"],
+                            "Amount ($)": [tot_spoils, tot_demo, tot_freight]
+                        })
+                        
+                        fig_donut = px.pie(allowance_df, values='Amount ($)', names='Allowance Type', hole=0.4,
+                                           color='Allowance Type',
+                                           color_discrete_map={"Spoils": "#8E2D28", "Demo Accrual": "#FFC000", "Freight": "#1E1E1E"})
+                        fig_donut.update_layout(margin=dict(t=20, b=20, l=20, r=20))
+                        st.plotly_chart(fig_donut, use_container_width=True)
+                    
+                    with chart_col2:
+                        st.markdown("**Volume by SKU (Cases)**")
+                        sku_df = master_df.groupby("Item Description")['Qty'].sum().reset_index()
+                        sku_df = sku_df.sort_values(by='Qty', ascending=True) 
+                        
+                        fig_bar = px.bar(sku_df, x='Qty', y='Item Description', orientation='h',
+                                         color_discrete_sequence=["#8E2D28"])
+                        fig_bar.update_layout(margin=dict(t=20, b=20, l=20, r=20), xaxis_title="Total Cases", yaxis_title="")
+                        st.plotly_chart(fig_bar, use_container_width=True)
+                    
+                    st.markdown("---")
+                    st.download_button(
+                        label="📥 Download Master Ledger (Excel)",
+                        data=create_excel_buffer(master_df),
+                        file_name="Audit Software: Delete After Use.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    
+                if failed_files:
+                    st.warning(f"⚠️ Skipped {len(failed_files)} file(s).")
+                    with st.expander("View Error Log"):
+                        for fail in failed_files: st.write(f"- **{fail['filename']}**: {fail['error']}")
+
+# --- MODULE B: VENDOR CRM ---
+with tab_crm:
+    st.title("Vendor CRM & Commission Matrix")
+    st.markdown("Manage vendor IDs and map SKU commission rates dynamically. Changes applied here will immediately take effect in the Audit Engine.")
+    st.markdown("---")
+    
+    col_crm_1, col_crm_2 = st.columns(2)
+    
+    with col_crm_1:
+        st.markdown("### ➕ Add New Vendor")
+        with st.form("add_vendor_form", clear_on_submit=True):
+            new_v_name = st.text_input("Vendor Name (e.g., KRAFT HEINZ)").upper()
+            new_v_id = st.text_input("Costco Vendor ID (Exact match required)")
+            submit_vendor = st.form_submit_button("Create Vendor Profile")
+            
+            if submit_vendor:
+                if new_v_id and new_v_name:
+                    if new_v_id in st.session_state["vendor_registry"]:
+                        st.error("Vendor ID already exists!")
+                    else:
+                        st.session_state["vendor_registry"][new_v_id] = {"name": new_v_name, "skus": {}}
+                        st.success(f"Vendor {new_v_name} added successfully!")
+                        st.rerun()
+                else:
+                    st.warning("Please fill out both fields.")
+
+    with col_crm_2:
+        st.markdown("### 📦 Add/Update SKU Rates")
+        vendor_options = {v_info["name"]: v_id for v_id, v_info in st.session_state["vendor_registry"].items()}
+        
+        if not vendor_options:
+            st.info("Please add a vendor first.")
+        else:
+            with st.form("add_sku_form", clear_on_submit=True):
+                selected_v_name = st.selectbox("Select Vendor", list(vendor_options.keys()))
+                new_sku = st.text_input("Costco Item # (SKU)")
+                new_rate = st.number_input("Commission Rate % (e.g., 3.0 for 3%)", min_value=0.0, max_value=100.0, step=0.1)
+                submit_sku = st.form_submit_button("Save SKU to Matrix")
                 
-                st.markdown("---")
-                
-                # --- EXCEL EXPORT ---
-                st.download_button(
-                    label="📥 Download Master Ledger (Excel)",
-                    data=create_excel_buffer(master_df),
-                    file_name="Audit Software: Delete After Use.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-            if failed_files:
-                st.warning(f"⚠️ Skipped {len(failed_files)} file(s).")
-                with st.expander("View Error Log"):
-                    for fail in failed_files: st.write(f"- **{fail['filename']}**: {fail['error']}")
+                if submit_sku:
+                    if new_sku:
+                        v_id = vendor_options[selected_v_name]
+                        decimal_rate = new_rate / 100.0
+                        st.session_state["vendor_registry"][v_id]["skus"][new_sku] = decimal_rate
+                        st.success(f"SKU {new_sku} saved at {new_rate}% for {selected_v_name}.")
+                        st.rerun()
+                    else:
+                        st.warning("Please enter a valid SKU.")
+
+    st.markdown("---")
+    st.markdown("### 🗄️ Current Active Directory")
+    
+    for v_id, v_info in st.session_state["vendor_registry"].items():
+        with st.expander(f"🏢 {v_info['name']} (ID: {v_id})", expanded=True):
+            if not v_info["skus"]:
+                st.write("No SKUs mapped yet.")
+            else:
+                sku_df = pd.DataFrame([
+                    {"Costco Item #": sku, "Commission Rate": f"{rate*100:.1f}%"} 
+                    for sku, rate in v_info["skus"].items()
+                ])
+                st.dataframe(sku_df, use_container_width=True, hide_index=True)
