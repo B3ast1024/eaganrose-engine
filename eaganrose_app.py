@@ -1,5 +1,3 @@
-
-
 import os
 import streamlit as st
 import pdfplumber
@@ -105,7 +103,7 @@ with st.sidebar:
         st.rerun()
 
 # =====================================================================
-# 4. CORE EXTRACTION ENGINE (UPGRADED FOR DYNAMIC ALLOWANCES)
+# 4. CORE EXTRACTION ENGINE (UPGRADED FOR DYNAMIC ALLOWANCES & REVISIONS)
 # =====================================================================
 class InvalidCostcoPOError(Exception):
     pass
@@ -149,12 +147,18 @@ def extract_costco_pdf_data(pdf_file_obj):
     else:
         header_data['Extracted PO Date'], header_data['PO Sequence'], header_data['Extracted Depot'] = "", "", ""
 
+    # Region / Revision Detection
     dept_match = re.search(r"Department\s*#[:\s\n]*([^\n]+)", text, re.IGNORECASE)
     if dept_match:
         parts = [p.strip() for p in dept_match.group(1).split('/')]
         raw_reg = parts[1] if len(parts) >= 2 else parts[0]
         reg_match = re.search(r"([A-Z]{2})", raw_reg)
-        header_data['Region'] = reg_match.group(1) if reg_match else raw_reg[:2]
+        
+        # Explicit check for "0" department signifying a revision
+        if "0" in raw_reg and not reg_match:
+            header_data['Region'] = "0"
+        else:
+            header_data['Region'] = reg_match.group(1) if reg_match else raw_reg[:2]
     else:
         header_data['Region'] = ""
     
@@ -240,7 +244,7 @@ def extract_costco_pdf_data(pdf_file_obj):
     return items_data
 
 def process_and_merge(df):
-    bd_mask = df['Region'].str.contains('BD', case=False, na=False)
+    bd_mask = df['Region'].astype(str).str.contains('BD', case=False, na=False)
     bd_data = df[bd_mask].copy()
     d12_data = df[~bd_mask].copy()
     
@@ -368,6 +372,14 @@ with tab_audit:
                     })
                     
                     st.success(f"Audit Complete! Processed {len(master_df)} valid records.")
+                    
+                    # --- REVISION ALERT MODULE ---
+                    # Check for any rows where the Region was logged as "0"
+                    revisions_df = master_df[master_df['Region'].astype(str).str.strip() == '0']
+                    if not revisions_df.empty:
+                        rev_po_list = revisions_df['Purchase Order #'].unique().tolist()
+                        st.warning(f"⚠️ **Attention: {len(rev_po_list)} Revision(s) Detected!**\nThe following POs were flagged as revisions (Department '0') and will need to be manually updated in your master ledger: **{', '.join(rev_po_list)}**")
+                    # -----------------------------
                     
                     st.markdown("### 📊 Operational Summary")
                     col1, col2, col3 = st.columns(3)
