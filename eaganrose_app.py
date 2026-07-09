@@ -3,6 +3,7 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
+import json
 from datetime import datetime
 import io
 from dateutil.relativedelta import relativedelta
@@ -27,6 +28,47 @@ with open(".streamlit/config.toml", "w") as f:
 
 st.set_page_config(page_title="Eaganrose Platform", layout="wide")
 
+# =====================================================================
+# 1B. VENDOR REGISTRY PERSISTENCE
+# =====================================================================
+# The vendor/SKU commission matrix is core business data — it shouldn't
+# live only in st.session_state, which resets on every app restart.
+# It's persisted to a JSON file on disk (survives restarts on this
+# instance) AND exportable/importable as a JSON download from the
+# Vendor & Allowance Matrix tab, since Streamlit Community Cloud's disk
+# is wiped on redeploy from GitHub — the download is your real backup.
+REGISTRY_FILE = "vendor_registry.json"
+
+DEFAULT_VENDOR_REGISTRY = {
+    "0010006727": {
+        "name": "DAESANG",
+        "default_spoils": 0.0075,  # 0.75% default for Daesang
+        "skus": {
+            "1570571": {"comm": 0.03, "spoils": None},
+            "1793017": {"comm": 0.03, "spoils": None},
+            "1908395": {"comm": 0.05, "spoils": None},
+            "1990882": {"comm": 0.05, "spoils": None},
+            "2059134": {"comm": 0.05, "spoils": None}
+        }
+    }
+}
+
+def load_vendor_registry():
+    if os.path.exists(REGISTRY_FILE):
+        try:
+            with open(REGISTRY_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            st.warning(f"⚠️ Could not read {REGISTRY_FILE} — falling back to default registry.")
+    return json.loads(json.dumps(DEFAULT_VENDOR_REGISTRY))  # deep copy
+
+def save_vendor_registry():
+    try:
+        with open(REGISTRY_FILE, "w") as f:
+            json.dump(st.session_state["vendor_registry"], f, indent=2)
+    except OSError as e:
+        st.warning(f"⚠️ Could not save vendor registry to disk: {e}")
+
 # Initialize memory for Login, Audit Logging, and the Advanced CRM
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
@@ -37,19 +79,7 @@ if "audit_log" not in st.session_state:
     
 # UPGRADED DATA STRUCTURE: Now supports default spoils and SKU-level overrides
 if "vendor_registry" not in st.session_state:
-    st.session_state["vendor_registry"] = {
-        "0010006727": {
-            "name": "DAESANG",
-            "default_spoils": 0.0075, # 0.75% default for Daesang
-            "skus": {
-                "1570571": {"comm": 0.03, "spoils": None}, 
-                "1793017": {"comm": 0.03, "spoils": None}, 
-                "1908395": {"comm": 0.05, "spoils": None}, 
-                "1990882": {"comm": 0.05, "spoils": None}, 
-                "2059134": {"comm": 0.05, "spoils": None}
-            }
-        }
-    }
+    st.session_state["vendor_registry"] = load_vendor_registry()
 
 # =====================================================================
 # 2. AUTHENTICATION MODULE
@@ -107,6 +137,15 @@ with st.sidebar:
 # =====================================================================
 class InvalidCostcoPOError(Exception):
     pass
+
+# Plausibility bounds for a single Costco case-pack line item. These exist to
+# catch cases where the layout regex grabs the wrong numbers (e.g. a stray
+# total or page number) instead of the real unit cost / qty, so bad rows get
+# flagged for manual review instead of silently entering the ledger.
+MIN_UNIT_COST = 0.01
+MAX_UNIT_COST = 10000.00
+MIN_QTY = 1
+MAX_QTY = 50000
 
 def extract_costco_pdf_data(pdf_file_obj):
     text = ""
@@ -175,6 +214,7 @@ def extract_costco_pdf_data(pdf_file_obj):
         header_data['PO Date'], header_data[' PO Del Date'], header_data['Cancel Date'], header_data["Est'd  Month   Pay'd"] = "", "", "", ""
     
     items_data = []
+    item_warnings = []
     item_matches = list(re.finditer(r"^(\d{1,3})\s+(\d{7})\s+.*?([A-Za-z].*?)\s+([\d\,\.]+)\s+(\d+)\s+CA", text, re.MULTILINE))
     
     if not item_matches:
@@ -184,8 +224,24 @@ def extract_costco_pdf_data(pdf_file_obj):
         item_dict = header_data.copy()
         sku = match.group(2)
         desc = match.group(3).strip().title()
-        unit_cost = float(match.group(4).replace(',', ''))
-        qty = int(match.group(5))
+
+        try:
+            unit_cost = float(match.group(4).replace(',', ''))
+            qty = int(match.group(5))
+        except ValueError:
+            item_warnings.append(
+                f"PO {po_number}, SKU {sku}: could not parse cost/qty from matched text — row skipped."
+            )
+            continue
+
+        # Plausibility check: catches cases where the layout regex grabbed the
+        # wrong numbers (e.g. a page total) instead of real unit cost / qty.
+        if not (MIN_UNIT_COST <= unit_cost <= MAX_UNIT_COST) or not (MIN_QTY <= qty <= MAX_QTY):
+            item_warnings.append(
+                f"PO {po_number}, SKU {sku}: implausible Unit Cost (${unit_cost:,.2f}) or "
+                f"Qty ({qty}) — row skipped, needs manual review."
+            )
+            continue
         
         item_dict['Costco Item #'] = sku
         item_dict['Item Description'] = desc
@@ -240,8 +296,13 @@ def extract_costco_pdf_data(pdf_file_obj):
         item_dict['Net Inv Amt'] = gross_amt - demo_total - spoils_calc - freight_allowance
         
         items_data.append(item_dict)
-        
-    return items_data
+
+    if not items_data:
+        raise InvalidCostcoPOError(
+            "All detected line items failed the plausibility check — no valid rows extracted."
+        )
+
+    return items_data, item_warnings
 
 def process_and_merge(df):
     bd_mask = df['Region'].astype(str).str.contains('BD', case=False, na=False)
@@ -352,11 +413,13 @@ with tab_audit:
     if uploaded_files:
         if st.button("Run Audit Engine"):
             with st.spinner(f"Ingesting {len(uploaded_files)} Purchase Orders..."):
-                all_data, failed_files = [], []
+                all_data, failed_files, row_warnings = [], [], []
                 for pdf_file in uploaded_files:
                     try:
-                        extracted_items = extract_costco_pdf_data(pdf_file)
+                        extracted_items, item_warnings = extract_costco_pdf_data(pdf_file)
                         all_data.extend(extracted_items)
+                        for w in item_warnings:
+                            row_warnings.append({"filename": pdf_file.name, "warning": w})
                     except Exception as e:
                         failed_files.append({"filename": pdf_file.name, "error": str(e)})
                 
@@ -379,6 +442,22 @@ with tab_audit:
                     if not revisions_df.empty:
                         rev_po_list = revisions_df['Purchase Order #'].unique().tolist()
                         st.warning(f"⚠️ **Attention: {len(rev_po_list)} Revision(s) Detected!**\nThe following POs were flagged as revisions (Department '0') and will need to be manually updated in your master ledger: **{', '.join(rev_po_list)}**")
+                    # -----------------------------
+
+                    # --- UNMAPPED VENDOR ALERT MODULE ---
+                    # Vendor ID wasn't found in the registry, so these rows were priced
+                    # at 0% commission and the absolute-fallback spoils rate — a silent
+                    # revenue leak unless it's caught here.
+                    unmapped_df = master_df[master_df['Vendor'].astype(str) == 'UNKNOWN_VENDOR']
+                    if not unmapped_df.empty:
+                        unmapped_po_list = unmapped_df['Purchase Order #'].unique().tolist()
+                        st.error(
+                            f"🚨 **{len(unmapped_po_list)} PO(s) from an Unmapped Vendor!**\n"
+                            f"These vendor IDs aren't in your Vendor & Allowance Matrix, so commission "
+                            f"was calculated at **0%** and spoils used the fallback rate — likely wrong. "
+                            f"Add the vendor in the **Vendor & Allowance Matrix** tab, then re-run the audit: "
+                            f"**{', '.join(unmapped_po_list)}**"
+                        )
                     # -----------------------------
                     
                     st.markdown("### 📊 Operational Summary")
@@ -430,6 +509,11 @@ with tab_audit:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                     
+                if row_warnings:
+                    st.warning(f"⚠️ {len(row_warnings)} line item(s) skipped for manual review (failed plausibility check).")
+                    with st.expander("View Skipped Rows"):
+                        for rw in row_warnings: st.write(f"- **{rw['filename']}**: {rw['warning']}")
+
                 if failed_files:
                     st.warning(f"⚠️ Skipped {len(failed_files)} file(s).")
                     with st.expander("View Error Log"):
@@ -461,6 +545,7 @@ with tab_crm:
                         st.session_state["vendor_registry"][new_v_id]["name"] = new_v_name
                         st.session_state["vendor_registry"][new_v_id]["default_spoils"] = new_v_spoils / 100.0
                         st.success(f"Vendor {new_v_name} updated successfully.")
+                    save_vendor_registry()
                     st.rerun()
                 else:
                     st.warning("Please fill out Vendor Name and ID.")
@@ -495,6 +580,7 @@ with tab_crm:
                             "spoils": decimal_spoils
                         }
                         st.success(f"SKU {new_sku} saved for {selected_v_name}.")
+                        save_vendor_registry()
                         st.rerun()
                     else:
                         st.warning("Please enter a valid SKU.")
@@ -521,3 +607,33 @@ with tab_crm:
                     })
                     
                 st.dataframe(pd.DataFrame(formatted_skus), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("### 💾 Backup & Restore")
+    st.caption(
+        "The matrix auto-saves to disk on every change, but a GitHub redeploy wipes that file. "
+        "Download a backup after making changes, and restore it here after any redeploy."
+    )
+    backup_col1, backup_col2 = st.columns(2)
+
+    with backup_col1:
+        st.download_button(
+            label="📥 Download Vendor Matrix Backup (JSON)",
+            data=json.dumps(st.session_state["vendor_registry"], indent=2),
+            file_name=f"eaganrose_vendor_matrix_{datetime.now().strftime('%Y-%m-%d')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
+    with backup_col2:
+        restore_file = st.file_uploader("📤 Restore from Backup", type="json", key="registry_restore")
+        if restore_file is not None:
+            try:
+                restored = json.load(restore_file)
+                if st.button("⚠️ Confirm Overwrite Current Matrix", use_container_width=True):
+                    st.session_state["vendor_registry"] = restored
+                    save_vendor_registry()
+                    st.success("Vendor matrix restored from backup.")
+                    st.rerun()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                st.error("That file isn't valid JSON — restore aborted, nothing was changed.")
