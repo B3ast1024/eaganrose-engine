@@ -9,6 +9,7 @@ from dateutil.relativedelta import relativedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import plotly.express as px
+import math
 
 # =====================================================================
 # 1. AUTO-THEMING ENGINE & SESSION STATE
@@ -35,12 +36,11 @@ if "username" not in st.session_state:
 if "audit_log" not in st.session_state:
     st.session_state["audit_log"] = []
     
-# UPGRADED DATA STRUCTURE: Now supports default spoils and SKU-level overrides
 if "vendor_registry" not in st.session_state:
     st.session_state["vendor_registry"] = {
         "0010006727": {
             "name": "DAESANG",
-            "default_spoils": 0.0075, # 0.75% default for Daesang
+            "default_spoils": 0.0075,
             "skus": {
                 "1570571": {"comm": 0.03, "spoils": None}, 
                 "1793017": {"comm": 0.03, "spoils": None}, 
@@ -103,7 +103,7 @@ with st.sidebar:
         st.rerun()
 
 # =====================================================================
-# 4. CORE EXTRACTION ENGINE (UPGRADED FOR DYNAMIC ALLOWANCES)
+# 4. CORE EXTRACTION ENGINE (UPGRADED FOR REVISIONS)
 # =====================================================================
 class InvalidCostcoPOError(Exception):
     pass
@@ -131,7 +131,6 @@ def extract_costco_pdf_data(pdf_file_obj):
     detected_vendor_name = "UNKNOWN_VENDOR"
     detected_vendor_info = None
     
-    # Dynamic Registry Check
     for v_id, v_info in st.session_state["vendor_registry"].items():
         if v_id in text:
             detected_vendor_name = v_info["name"]
@@ -139,20 +138,21 @@ def extract_costco_pdf_data(pdf_file_obj):
             break
             
     header_data['Vendor'] = detected_vendor_name
-    
-    if len(po_number) >= 11:
-        header_data['Extracted PO Date'] = po_number[-7:-3] 
-        header_data['PO Sequence'] = po_number[-3:]
-        header_data['Extracted Depot'] = po_number[:-7].lstrip('0') 
-    else:
-        header_data['Extracted PO Date'], header_data['PO Sequence'], header_data['Extracted Depot'] = "", "", ""
+    header_data['Extracted PO Date'] = ""
+    header_data['PO Sequence'] = ""
+    header_data['Extracted Depot'] = ""
 
+    # Region / Revision Detection
     dept_match = re.search(r"Department\s*#[:\s\n]*([^\n]+)", text, re.IGNORECASE)
     if dept_match:
         parts = [p.strip() for p in dept_match.group(1).split('/')]
         raw_reg = parts[1] if len(parts) >= 2 else parts[0]
         reg_match = re.search(r"([A-Z]{2})", raw_reg)
-        header_data['Region'] = reg_match.group(1) if reg_match else raw_reg[:2]
+        # If the department is literally "0", we flag it as a revision by setting Region to "0"
+        if "0" in raw_reg and not reg_match:
+            header_data['Region'] = "0"
+        else:
+            header_data['Region'] = reg_match.group(1) if reg_match else raw_reg[:2]
     else:
         header_data['Region'] = ""
     
@@ -186,9 +186,8 @@ def extract_costco_pdf_data(pdf_file_obj):
         item_dict['Unit Cost'] = unit_cost
         item_dict['Qty'] = qty
         
-        # --- DYNAMIC RATE APPLICATION ---
         comm_rate = 0.0
-        spoils_rate = 0.0075 # Absolute fallback
+        spoils_rate = 0.0075 
         
         if detected_vendor_info:
             spoils_rate = detected_vendor_info.get("default_spoils", 0.0075)
@@ -197,13 +196,12 @@ def extract_costco_pdf_data(pdf_file_obj):
             if isinstance(sku_data, dict):
                 comm_rate = sku_data.get("comm", 0.0)
                 if sku_data.get("spoils") is not None:
-                    spoils_rate = sku_data["spoils"] # Override with SKU specific spoil rate
+                    spoils_rate = sku_data["spoils"] 
             else:
-                comm_rate = sku_data # Legacy fallback just in case
+                comm_rate = sku_data 
                 
         item_dict['Com   %   Rate'] = comm_rate
         item_dict['Spoils'] = spoils_rate
-        # ---------------------------------
         
         chunk_start = match.end()
         chunk_end = item_matches[i+1].start() if i + 1 < len(item_matches) else len(text)
@@ -230,31 +228,84 @@ def extract_costco_pdf_data(pdf_file_obj):
         item_dict['Freight Allowance'] = freight_allowance
         
         gross_amt = unit_cost * qty
-        spoils_calc = gross_amt * spoils_rate # NOW USES DYNAMIC RATE
+        spoils_calc = gross_amt * spoils_rate 
         item_dict['Net Inv Amt'] = gross_amt - demo_total - spoils_calc - freight_allowance
         
         items_data.append(item_dict)
         
     return items_data
 
-def process_and_merge(df):
-    bd_mask = df['Region'].str.contains('BD', case=False, na=False)
-    bd_data = df[bd_mask].copy()
-    d12_data = df[~bd_mask].copy()
+def process_and_merge(pdf_data, excel_file=None):
+    pdf_df = pd.DataFrame(pdf_data)
     
-    if not bd_data.empty:
-        bd_data['Dead Net Cost'] = bd_data['Unit Cost'] - bd_data['Freight Allowance'] - bd_data['Demo Accrual Deduction']
-        bd_data['Total Dead Net Amt'] = bd_data['Dead Net Cost'] * bd_data['Qty']
+    # If historical data is provided, sync and deduplicate
+    if excel_file is not None and not pdf_df.empty:
+        try:
+            excel_df = pd.read_excel(excel_file, engine='openpyxl')
+            
+            # Create unique IDs to match PO and SKU
+            excel_df['UID'] = excel_df['Purchase Order #'].astype(str) + "_" + excel_df['Costco Item #'].astype(str)
+            pdf_df['UID'] = pdf_df['Purchase Order #'].astype(str) + "_" + pdf_df['Costco Item #'].astype(str)
+            
+            # Extract historical metadata we don't want to lose
+            history_meta = excel_df.set_index('UID')
+            
+            for idx, row in pdf_df.iterrows():
+                uid = row['UID']
+                
+                # 1. Restore the true Region if this is a Revision ("0")
+                if str(row['Region']).strip() == '0' and uid in history_meta.index:
+                    pdf_df.at[idx, 'Region'] = history_meta.at[uid, 'Region']
+                    
+                # 2. Rescue manual data entries (Comments, Check #, Dates)
+                if uid in history_meta.index:
+                    pdf_df.at[idx, 'Ck #'] = history_meta.at[uid, 'Ck #'] if 'Ck #' in history_meta.columns else ''
+                    pdf_df.at[idx, 'Date Comm  Paid'] = history_meta.at[uid, 'Date Comm  Paid'] if 'Date Comm  Paid' in history_meta.columns else ''
+                    pdf_df.at[idx, 'Total Comision Paid'] = history_meta.at[uid, 'Total Comision Paid'] if 'Total Comision Paid' in history_meta.columns else 0.0
+                    pdf_df.at[idx, 'Comments'] = history_meta.at[uid, 'Comments'] if 'Comments' in history_meta.columns else ''
+
+            # Drop the old versions of these POs from the historical dataframe
+            pdf_uids = pdf_df['UID'].tolist()
+            excel_df_kept = excel_df[~excel_df['UID'].isin(pdf_uids)]
+            
+            # Combine everything and clean up
+            master_df = pd.concat([excel_df_kept, pdf_df], ignore_index=True)
+            master_df = master_df.drop(columns=['UID'])
+            
+        except Exception as e:
+            st.error(f"Error merging with Ledger: {e}")
+            master_df = pdf_df
+    else:
+        master_df = pdf_df
         
-    master_df = pd.concat([bd_data, d12_data], ignore_index=True)
+    # Re-calculate BD specific logic
+    if 'Region' in master_df.columns:
+        bd_mask = master_df['Region'].str.contains('BD', case=False, na=False)
+        bd_data = master_df[bd_mask].copy()
+        d12_data = master_df[~bd_mask].copy()
+        
+        if not bd_data.empty:
+            bd_data['Dead Net Cost'] = bd_data['Unit Cost'] - bd_data['Freight Allowance'] - bd_data['Demo Accrual Deduction']
+            bd_data['Total Dead Net Amt'] = bd_data['Dead Net Cost'] * bd_data['Qty']
+            
+        master_df = pd.concat([bd_data, d12_data], ignore_index=True)
+
+    # Sort final ledger by Date
     if 'PO Date' in master_df.columns:
-        master_df = master_df.sort_values(by='PO Date', ascending=True)
+        master_df['PO Date Temp'] = pd.to_datetime(master_df['PO Date'], errors='coerce')
+        master_df = master_df.sort_values(by='PO Date Temp', ascending=True).drop(columns=['PO Date Temp'])
+        
     return master_df
 
 def parse_date(date_str):
-    if not date_str: return None
-    try: return datetime.strptime(date_str, "%Y-%m-%d").date()
-    except: return date_str
+    if pd.isna(date_str) or not date_str: return None
+    if isinstance(date_str, datetime): return date_str.date()
+    try: return datetime.strptime(str(date_str).split()[0], "%Y-%m-%d").date()
+    except: return str(date_str)
+
+def clean_val(val, default=''):
+    if pd.isna(val): return default
+    return val
 
 def create_excel_buffer(master_df):
     output = io.BytesIO()
@@ -288,13 +339,31 @@ def create_excel_buffer(master_df):
         
     for idx, row in master_df.iterrows():
         ws.append([
-            parse_date(row.get('PO Date', '')), row.get('Vendor', ''), row.get('Region', ''),
-            row.get('Extracted Depot', ''), row.get('Extracted PO Date', ''), row.get('PO Sequence', ''), '',
-            row.get('Costco Item #', ''), row.get('Item Description', ''), parse_date(row.get('Cancel Date', '')),
-            parse_date(row.get(' PO Del Date', '')), row.get('Qty', 0), row.get('Unit Cost', 0.0),
-            row.get('Spoils', 0.0), row.get('Freight Allowance', 0.0), row.get('Demo Accrual Deduction', 0.0),
-            row.get('Net Inv Amt', 0.0), row.get('Com   %   Rate', 0.0), 0.0,
-            parse_date(row.get("Est'd  Month   Pay'd", '')), None, None, None, 0.0, ''
+            parse_date(row.get('PO Date')), 
+            clean_val(row.get('Vendor')), 
+            clean_val(row.get('Region')),
+            clean_val(row.get('Purchase Order #')), 
+            '', 
+            '', 
+            '',
+            clean_val(row.get('Costco Item #')), 
+            clean_val(row.get('Item Description')), 
+            parse_date(row.get('Cancel Date')),
+            parse_date(row.get(' PO Del Date')), 
+            clean_val(row.get('Qty'), 0), 
+            clean_val(row.get('Unit Cost'), 0.0),
+            clean_val(row.get('Spoils'), 0.0), 
+            clean_val(row.get('Freight Allowance'), 0.0), 
+            clean_val(row.get('Demo Accrual Deduction'), 0.0),
+            clean_val(row.get('Net Inv Amt'), 0.0), 
+            clean_val(row.get('Com   %   Rate'), 0.0), 
+            0.0,
+            parse_date(row.get("Est'd  Month   Pay'd")), 
+            parse_date(row.get('Date Comm  Paid')), 
+            clean_val(row.get('Ck #')), 
+            clean_val(row.get('Total Comision Paid'), 0.0), 
+            0.0, 
+            clean_val(row.get('Comments'))
         ])
         
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=25):
@@ -313,7 +382,7 @@ def create_excel_buffer(master_df):
             elif col in [14, 18]: cell.number_format = '0.00%'
             elif col in [15, 16]: cell.number_format = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)'
             elif col in [17, 19, 24]: cell.number_format = '"$"#,##0.00'
-            elif col in [1, 10, 11]: cell.number_format = 'dd-mmm-yy'
+            elif col in [1, 10, 11, 21]: cell.number_format = 'dd-mmm-yy'
             elif col == 20: cell.number_format = 'mmm-yy'
                 
         row_idx = row[0].row
@@ -338,15 +407,22 @@ with tab_audit:
         pass
 
     st.title("Eaganrose Reconciliation Engine")
-    st.markdown("Automated PDF Ingestion & Variance Auditing for Costco Vendors")
+    st.markdown("Automated PDF Ingestion, Ledger Sync, & Variance Auditing")
     st.markdown("---")
 
-    uploaded_files = st.file_uploader("Upload Costco POs (PDF)", type="pdf", accept_multiple_files=True)
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        uploaded_files = st.file_uploader("1. Upload New Costco POs (PDF)", type="pdf", accept_multiple_files=True)
+    with col_up2:
+        uploaded_ledger = st.file_uploader("2. Upload Historical Ledger (Excel - Optional)", type=["xlsx", "xls"])
+        st.caption("Uploading your master ledger will automatically deduplicate revisions and preserve your existing notes.")
 
     if uploaded_files:
-        if st.button("Run Audit Engine"):
+        if st.button("Sync & Run Audit Engine", use_container_width=True):
             with st.spinner(f"Ingesting {len(uploaded_files)} Purchase Orders..."):
                 all_data, failed_files = [], []
+                
+                # 1. Read the PDFs
                 for pdf_file in uploaded_files:
                     try:
                         extracted_items = extract_costco_pdf_data(pdf_file)
@@ -355,20 +431,31 @@ with tab_audit:
                         failed_files.append({"filename": pdf_file.name, "error": str(e)})
                 
                 if all_data:
-                    master_df = process_and_merge(pd.DataFrame(all_data))
+                    # 2. Process and Sync with Excel Memory
+                    master_df = process_and_merge(all_data, uploaded_ledger)
                     
                     unique_pos = list(master_df['Purchase Order #'].unique())
                     st.session_state["audit_log"].append({
                         "timestamp": datetime.now().strftime("%Y-%m-%d %I:%M %p"),
                         "user": st.session_state["username"],
                         "files_count": len(uploaded_files),
-                        "po_numbers": ", ".join(unique_pos)
+                        "po_numbers": f"Processed {len(unique_pos)} Unique POs"
                     })
                     
-                    st.success(f"Audit Complete! Processed {len(master_df)} valid records.")
+                    st.success(f"Audit Complete! Ledger synchronized with {len(master_df)} total records.")
                     
-                    st.markdown("### 📊 Operational Summary")
+                    st.markdown("### 📊 Operational Summary (New & Synced Data)")
                     col1, col2, col3 = st.columns(3)
+                    
+                    # Convert to numeric for dashboard graphing in case Excel strings carried over
+                    master_df['Net Inv Amt'] = pd.to_numeric(master_df['Net Inv Amt'], errors='coerce').fillna(0)
+                    master_df['Com   %   Rate'] = pd.to_numeric(master_df['Com   %   Rate'], errors='coerce').fillna(0)
+                    master_df['Qty'] = pd.to_numeric(master_df['Qty'], errors='coerce').fillna(0)
+                    master_df['Unit Cost'] = pd.to_numeric(master_df['Unit Cost'], errors='coerce').fillna(0)
+                    master_df['Spoils'] = pd.to_numeric(master_df['Spoils'], errors='coerce').fillna(0)
+                    master_df['Demo Accrual Deduction'] = pd.to_numeric(master_df['Demo Accrual Deduction'], errors='coerce').fillna(0)
+                    master_df['Freight Allowance'] = pd.to_numeric(master_df['Freight Allowance'], errors='coerce').fillna(0)
+
                     tot_net = master_df['Net Inv Amt'].sum()
                     tot_comm = (master_df['Net Inv Amt'] * master_df['Com   %   Rate']).sum()
                     tot_qty = int(master_df['Qty'].sum())
@@ -382,7 +469,6 @@ with tab_audit:
                     
                     with chart_col1:
                         st.markdown("**Allowance Breakdown**")
-                        # Spoils are now calculated dynamically per row!
                         tot_spoils = (master_df['Unit Cost'] * master_df['Qty'] * master_df['Spoils']).sum()
                         tot_demo = master_df['Demo Accrual Deduction'].sum()
                         tot_freight = master_df['Freight Allowance'].sum()
@@ -410,9 +496,9 @@ with tab_audit:
                     
                     st.markdown("---")
                     st.download_button(
-                        label="📥 Download Master Ledger (Excel)",
+                        label="📥 Download Synchronized Master Ledger (Excel)",
                         data=create_excel_buffer(master_df),
-                        file_name="Audit Software: Delete After Use.xlsx",
+                        file_name=f"Eaganrose_Ledger_Synced_{datetime.now().strftime('%Y%m%d')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                     
@@ -496,7 +582,6 @@ with tab_crm:
             else:
                 formatted_skus = []
                 for sku, data in v_info["skus"].items():
-                    # Handle data cleanly
                     comm = data['comm'] if isinstance(data, dict) else data
                     spoils = data.get('spoils') if isinstance(data, dict) else None
                     
